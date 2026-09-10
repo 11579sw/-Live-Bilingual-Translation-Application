@@ -14,6 +14,7 @@ import signal
 import queue
 import threading
 import requests
+import tkinter as tk
 import numpy as np 
 import pyaudio
 import webrtcvad
@@ -121,6 +122,66 @@ Output ONLY a JSON object matching this schema:
         corrected = corrected[0].upper() + corrected[1:]
     return corrected
 
+# --- 4. GUI：原始英文与译文分行显示，增量更新 ---
+ui_queue = queue.Queue()
+
+def append_gui_text(widget, text_value):
+    if not text_value:
+        return
+    widget.configure(state="normal")
+    widget.insert(tk.END, text_value + "\n")
+    widget.see(tk.END)
+    widget.configure(state="disabled")
+
+def process_ui_queue():
+    try:
+        while True:
+            item = ui_queue.get_nowait()
+            if "english" in item and item["english"]:
+                append_gui_text(english_text_widget, item["english"])
+            if "translation" in item and item["translation"]:
+                append_gui_text(chinese_text_widget, item["translation"])
+    except queue.Empty:
+        pass
+    root.after(80, process_ui_queue)
+
+root = tk.Tk()
+root.title("Live Bilingual Classroom Translation")
+root.geometry("1100x650")
+root.configure(bg="#f3f6fb")
+
+header = tk.Label(
+    root,
+    text="Live Bilingual Classroom Translation",
+    font=("Arial", 18, "bold"),
+    bg="#f3f6fb",
+    pady=12,
+)
+header.pack(fill="x")
+
+panel = tk.Frame(root, bg="#f3f6fb")
+panel.pack(fill="both", expand=True, padx=18, pady=(0, 18))
+
+english_label = tk.Label(panel, text="Original English", font=("Arial", 12, "bold"), anchor="w", bg="#f3f6fb")
+english_label.pack(fill="x", pady=(8, 4))
+english_text_widget = tk.Text(panel, height=12, wrap="word", font=("Arial", 12), bg="white", state="disabled")
+english_scroll = tk.Scrollbar(panel, command=english_text_widget.yview)
+english_text_widget.configure(yscrollcommand=english_scroll.set)
+english_scroll.pack(side="right", fill="y")
+english_text_widget.pack(fill="both", expand=True)
+
+chinese_label = tk.Label(panel, text="Translation (Chinese)", font=("Arial", 12, "bold"), anchor="w", bg="#f3f6fb")
+chinese_label.pack(fill="x", pady=(12, 4))
+chinese_text_widget = tk.Text(panel, height=12, wrap="word", font=("Arial", 12), bg="#f8fbff", state="disabled")
+chinese_scroll = tk.Scrollbar(panel, command=chinese_text_widget.yview)
+chinese_text_widget.configure(yscrollcommand=chinese_scroll.set)
+chinese_scroll.pack(side="right", fill="y")
+chinese_text_widget.pack(fill="both", expand=True)
+
+status_var = tk.StringVar(value="Listening for speech...")
+status_bar = tk.Label(root, textvariable=status_var, bg="#eaf3ff", fg="#243b5a", font=("Arial", 11), pady=8)
+status_bar.pack(fill="x")
+
 # --- 4. 初始化音频设备 ---
 FORMAT = pyaudio.paInt16
 TARGET_RATE = 16000
@@ -157,7 +218,10 @@ for try_channels in [2, 1]:
         break
 
 if stream is None:
+    status_var.set("Microphone not available. Please check device settings.")
     print("❌ 无法打开任何麦克风设备，请检查设备连接！")
+    root.update_idletasks()
+    root.mainloop()
     sys.exit(1)
 
 vad = webrtcvad.Vad(2)  # 敏感度设置为 2，更好防误触
@@ -184,28 +248,32 @@ def worker():
             task_queue.task_done()
             continue
 
-        # 1. 语音转文字 (STT) - 利用 initial_prompt 传入上一句课堂上下文，保持语意连贯
+        # 1. 语音转文字
         t_stt_start = time.time()
         segments, _ = stt_model.transcribe(
-            audio_float32, 
-            beam_size=1,                         # 提速核心
+            audio_float32,
+            beam_size=1,
             language="en",
-            initial_prompt=last_classroom_context, # 动态上下文提示
-            no_speech_threshold=0.6,             # ⚡ 抗幻觉 2：静音概率>60%直接跳过
-            log_prob_threshold=-1.0,             # ⚡ 抗幻觉 3：修正拼写为 log_prob_threshold
-            compression_ratio_threshold=2.4       # ⚡ 抗幻觉 4：防止重复打印特定单词
+            initial_prompt=last_classroom_context,
+            no_speech_threshold=0.6,
+            log_prob_threshold=-1.0,
+            compression_ratio_threshold=2.4,
         )
         transcription = " ".join([segment.text.strip() for segment in segments]).strip()
         stt_delay = time.time() - t_stt_start
 
-        # 2. 动态模型/服务句子与短语纠错 + 专用模型快速翻译
         if transcription:
             t_trans_start = time.time()
             corrected_en = correct_sentence_dynamic(transcription, context_text=last_classroom_context)
-            translated_zh = translate_text(corrected_en)            
+            translated_zh = translate_text(corrected_en)
             trans_delay = time.time() - t_trans_start
 
-            last_classroom_context = corrected_en # 动态更新上下文记录
+            last_classroom_context = corrected_en
+
+            ui_queue.put({
+                "english": corrected_en,
+                "translation": translated_zh,
+            })
 
             print(f"\n🎙️ [STT English ]: {transcription}")
             print(f"✏️ [Dynamic Correct]: {corrected_en}")
@@ -221,49 +289,54 @@ threading.Thread(target=worker, daemon=True).start()
 print("🎤 All systems ready! (Press Ctrl+C to stop instantly)")
 print("=" * 65)
 
-# --- 6. 主音频采集循环 (永不阻塞) ---
-speech_buffer = []
-silence_frames = 0
-HW_CHUNK = int(HW_RATE * FRAME_DURATION_MS / 1000)
+# --- 6. 主音频采集循环（后台线程：避免阻塞 GUI）---
+def audio_capture_loop():
+    speech_buffer = []
+    silence_frames = 0
+    HW_CHUNK = int(HW_RATE * FRAME_DURATION_MS / 1000)
 
-try:
-    while True:
-        frame_raw = stream.read(HW_CHUNK, exception_on_overflow=False)
-        frame_np = np.frombuffer(frame_raw, dtype=np.int16)
+    try:
+        while True:
+            frame_raw = stream.read(HW_CHUNK, exception_on_overflow=False)
+            frame_np = np.frombuffer(frame_raw, dtype=np.int16)
 
-        if CHANNELS == 2:
-            frame_mono = frame_np.reshape(-1, 2).mean(axis=1).astype(np.int16)
-        else:
-            frame_mono = frame_np
+            if CHANNELS == 2:
+                frame_mono = frame_np.reshape(-1, 2).mean(axis=1).astype(np.int16)
+            else:
+                frame_mono = frame_np
 
-        if HW_RATE != TARGET_RATE:
-            frame_16k = resample_poly(frame_mono, TARGET_RATE, HW_RATE).astype(np.int16)
-        else:
-            frame_16k = frame_mono
+            if HW_RATE != TARGET_RATE:
+                frame_16k = resample_poly(frame_mono, TARGET_RATE, HW_RATE).astype(np.int16)
+            else:
+                frame_16k = frame_mono
 
-        if len(frame_16k) < TARGET_CHUNK:
-            frame_16k = np.pad(frame_16k, (0, TARGET_CHUNK - len(frame_16k)))
-        elif len(frame_16k) > TARGET_CHUNK:
-            frame_16k = frame_16k[:TARGET_CHUNK]
+            if len(frame_16k) < TARGET_CHUNK:
+                frame_16k = np.pad(frame_16k, (0, TARGET_CHUNK - len(frame_16k)))
+            elif len(frame_16k) > TARGET_CHUNK:
+                frame_16k = frame_16k[:TARGET_CHUNK]
 
-        frame_bytes = frame_16k.tobytes()
-        is_speech = vad.is_speech(frame_bytes, TARGET_RATE)
+            frame_bytes = frame_16k.tobytes()
+            is_speech = vad.is_speech(frame_bytes, TARGET_RATE)
 
-        if is_speech:
-            speech_buffer.append(frame_bytes)
-            silence_frames = 0
-            print("\r🔊 [speaking...]", end="", flush=True)
-        else:
-            silence_frames += 1
-            if len(speech_buffer) > 0:
-                print("\r.  [waiting for pause...]", end="", flush=True)
+            if is_speech:
+                speech_buffer.append(frame_bytes)
+                silence_frames = 0
+                status_var.set("Listening... speech detected")
+            else:
+                silence_frames += 1
+                if len(speech_buffer) > 0:
+                    status_var.set("Waiting for pause...")
 
-        # 触发切片：静音超时 或 连续说话时间过长
-        if (silence_frames > MAX_SILENCE_FRAMES or len(speech_buffer) > MAX_SPEECH_FRAMES) and len(speech_buffer) > 0:
-            if len(speech_buffer) > 15:  # 过滤低于 450ms 的杂音
-                task_queue.put(b''.join(speech_buffer))
-            speech_buffer = []
-            silence_frames = 0
+            if (silence_frames > MAX_SILENCE_FRAMES or len(speech_buffer) > MAX_SPEECH_FRAMES) and len(speech_buffer) > 0:
+                if len(speech_buffer) > 15:
+                    task_queue.put(b''.join(speech_buffer))
+                speech_buffer = []
+                silence_frames = 0
 
-except Exception as e:
-    print(f"\nError: {e}")
+    except Exception as e:
+        status_var.set("Audio stream error")
+        print(f"\nError: {e}")
+
+threading.Thread(target=audio_capture_loop, daemon=True).start()
+root.after(80, process_ui_queue)
+root.mainloop()
