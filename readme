@@ -1,0 +1,346 @@
+# Live Bilingual Classroom Translation Application
+
+## Project Objective
+This project is a real-time classroom speech translation prototype designed for live bilingual support in English-speaking lectures. It captures spoken English from the microphone, transcribes the speech, performs lightweight correction, translates the corrected English into Chinese, and displays the original and translated text in a live GUI.
+
+The system is designed to balance the following constraints:
+- low end-to-end latency
+- local processing and privacy
+- acceptable robustness under classroom noise
+- simple deployment on a regular laptop
+
+## Intended Use Case
+The primary use case is a classroom or lecture environment where students may need real-time transcription and translation while following the instructor. The system is not intended to replace a professional captioning system, but it aims to provide a lightweight and practical prototype that can run locally on common student hardware.
+
+## System Overview
+
+Audio input -> VAD / energy gate -> local transcription -> correction -> translation -> display
+
+### Major pipeline stages
+1. Audio capture from the default microphone
+2. Voice Activity Detection (VAD) and silence filtering
+3. Local speech-to-text using faster-whisper
+4. Lightweight correction using a local LLM via Ollama, with fallback safety logic
+5. Translation using MarianMT
+6. Display in a Tkinter GUI with separate panels for original, corrected, and translated text
+
+## Components and Engineering Decisions
+
+### 1. Audio capture
+Selected option: built-in laptop microphone
+
+Why this choice:
+- portable and easy for student demo use
+- no additional hardware required
+- works on common laptops
+- suitable for rapid prototype development
+
+Alternatives considered:
+- external USB microphone: better sound quality, but more setup complexity and cost
+- wireless microphone: stronger acoustic quality, but less portability and more calibration overhead
+
+Trade-off:
+- a built-in microphone is weaker in noisy classrooms and room reverberation
+- it is still the most practical option for a project prototype with low setup burden
+
+### 2. Noise handling
+Selected method: WebRTC VAD + RMS energy threshold
+
+Why this choice:
+- low latency
+- simple to implement
+- no heavy denoising model required
+- suitable for live classroom conditions
+
+Alternatives considered:
+- deep denoising models: stronger audio cleanup but heavier compute and higher delay
+- beamforming or external hardware: stronger hardware-based noise suppression, but not portable or affordable for a student project
+
+### 3. Transcription
+Selected model: faster-whisper base.en on CPU
+
+Why this choice:
+- local execution preserves privacy
+- no cloud API usage cost
+- no internet dependency
+- faster than cloud service round-trip for a classroom demo
+
+Alternatives considered:
+- cloud transcription APIs: stronger in noisy environments but more expensive and slower due to network delay
+- another local open-source model: possible, but faster-whisper is a strong balance between quality, speed, and ease of integration
+
+### 4. Correction
+Selected flow: local Ollama-based correction with rule-based fallback
+
+Why this choice:
+- improves transcription quality in classroom context
+- local model means lower privacy risk
+- if Ollama is unavailable, the system still continues with basic cleanup logic
+
+Alternatives considered:
+- remote LLM correction: stronger semantic correction but introduces delay, cost, and privacy concerns
+- no correction step: simpler but worse output quality
+
+### 5. Translation
+Selected model: Helsinki-NLP/opus-mt-en-zh via MarianMT
+
+Why this choice:
+- dedicated translation model is faster and more deterministic than a general-purpose LLM
+- keeps latency low
+- good quality for short classroom sentences
+
+Alternatives considered:
+- same LLM for both correction and translation: more flexible but slower and less optimized for translation
+- cloud translation API: convenient but network dependency and privacy issues
+
+### 6. User interface
+Selected framework: Python Tkinter
+
+Why this choice:
+- easy to prototype and debug
+- runs directly on local machines
+- low setup complexity
+- suitable for a project demonstration
+
+Alternatives considered:
+- native macOS or desktop UI frameworks: more polished but platform-specific
+- web app: visually modern but more infrastructure required for microphone access and deployment
+
+## Hardware and Software Requirements
+
+### Required environment
+- Linux / macOS / Windows (tested primarily on Linux)
+- Python 3.10 or newer is recommended
+- microphone-enabled local machine
+- working audio input device
+- local audio backend available through PulseAudio, PipeWire, or ALSA
+
+### Python version and environment
+This project was developed and tested with Python 3.10+ and a local virtual environment is recommended.
+
+```bash
+python --version
+python -m venv .venv
+source .venv/bin/activate   # Linux / macOS
+# .venv\Scripts\activate    # Windows PowerShell
+```
+
+### Python dependencies
+Install the required packages with:
+
+```bash
+pip install pyaudio webrtcvad faster-whisper scipy numpy requests transformers torch
+```
+
+For some Linux systems, the GUI may also require:
+
+```bash
+sudo apt update
+sudo apt install python3-tk
+```
+
+### Ollama requirement
+Yes. The correction stage uses a local Ollama model. If Ollama is not running, the app will still start but the correction step may fall back to rule-based cleanup instead of using the LLM.
+
+Start the required model before running the application:
+
+```bash
+ollama run qwen2.5:0.5b
+```
+
+You can also configure the model and endpoint with environment variables:
+
+```bash
+export OLLAMA_URL=http://localhost:11434/api/generate
+export CORRECTION_MODEL=qwen2.5:0.5b
+```
+
+### Model names used in the project
+- Speech-to-text: `faster-whisper` with model `base.en`
+- Correction model: `qwen2.5:0.5b` via Ollama
+- Translation model: `Helsinki-NLP/opus-mt-en-zh` via MarianMT
+
+### Microphone permissions and device access
+The application uses the system default microphone. You must allow microphone access in the operating system.
+
+- Windows: allow microphone access in Settings > Privacy & security > Microphone
+- macOS: allow microphone access in System Settings > Privacy & Security > Microphone
+- Linux: ensure the current user can access the audio device and that the microphone is not muted
+
+Common checks:
+
+```bash
+arecord -l
+pactl list sources short
+```
+
+If your user is not allowed to access audio devices, try:
+
+```bash
+sudo usermod -aG audio "$USER"
+```
+
+Then log out and back in again.
+
+### Linux ALSA / PipeWire configuration
+On Linux, PyAudio can fail if the system sound stack is not detected correctly. The project already sets the ALSA plugin directory in code when possible, but if you run into issues, the following checks are useful.
+
+Check ALSA devices:
+
+```bash
+arecord -L
+```
+
+If needed, set the plugin directory manually before launching the app:
+
+```bash
+export ALSA_PLUGIN_DIR=/usr/lib/x86_64-linux-gnu/alsa-lib
+```
+
+If PipeWire is installed but not active, try:
+
+```bash
+sudo apt install pipewire pipewire-pulse pavucontrol
+systemctl --user restart pipewire pipewire-pulse
+```
+
+Then open the audio mixer to verify the microphone is available:
+
+```bash
+pavucontrol
+```
+
+### VAD and audio chunking
+The system uses 30 ms frames and a 16 kHz audio pipeline to stay compatible with WebRTC VAD. This is a practical compromise between latency and robustness.
+
+## Run Instructions
+From the project directory:
+
+```bash
+source .venv/bin/activate   # Linux / macOS
+python light_audio_llm.py
+```
+
+On Windows PowerShell:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python light_audio_llm.py
+```
+
+Then:
+- speak into the microphone
+- the system will capture speech segments
+- original English transcription appears in the first panel
+- a corrected sentence may appear in the second panel
+- Chinese translation appears in the third panel
+
+If the GUI does not open, check that your display environment is available and that the Tkinter package is installed.
+
+## Important Setup Notes
+
+### Microphone issue on Linux
+Some systems expose stereo input devices even when the physical microphone is single-channel. The app handles this by converting stereo to mono inside the processing pipeline.
+
+### ALSA / PipeWire issue
+On Linux, PyAudio may fail to detect the proper sound backend if the environment is not configured correctly. In some setups, adding the ALSA plugin directory helps. If the system uses PipeWire, make sure the microphone source is active and the device is visible to the OS.
+
+### GUI startup troubleshooting
+If the script runs but no window appears:
+
+```bash
+python -c "import tkinter; print('tk ok')"
+```
+
+If this fails, install the GUI dependency:
+
+```bash
+sudo apt install python3-tk
+```
+
+Also make sure the system is running a desktop session, not only a terminal.
+
+## Project Files
+- [light_audio_llm.py](light_audio_llm.py): the live microphone, transcription, correction, translation, and GUI pipeline
+- [generate_report.py](generate_report.py): creates the final PDF report
+- [live_bilingual_classroom_translation_report.pdf](live_bilingual_classroom_translation_report.pdf): generated technical report
+- [readme](readme): project instructions and test notes
+
+## Testing and Verification Plan
+
+### Required demonstration conditions
+The project should be evaluated under the following conditions:
+
+1. Quiet baseline test
+   - speaker stands close to the microphone
+   - no obvious background noise
+   - record whether the transcription is stable and accurate
+
+2. Mild classroom noise test
+   - one or two nearby students speaking in background
+   - room fan or HVAC noise present
+   - check whether filtering and VAD still isolate the target speech
+
+3. Moderate noise test
+   - classroom with more people or sustained background sound
+   - record false positives, missed phrases, and output delays
+
+4. Latency test
+   - measure total time from speech start to final translated text display
+   - target: around 3 seconds or less
+
+### Suggested test procedure
+For each test run:
+- start recording the application output
+- speak a fixed sentence such as: “In this lecture, we will analyze the relationship between model performance and latency.”
+- record the time when speaking starts
+- record the time when the English text appears
+- record the time when the Chinese translation appears
+- log the end-to-end delay
+
+### Minimum evidence to collect
+- screenshot of the GUI showing original English + corrected + Chinese translation
+- terminal logs showing recognition output
+- time stamps for STT and translation stages
+- note about classroom noise level
+- note about microphone distance and environment
+
+## Example Test Table
+
+| Test case | Noise level | Sentence | STT result | Correction result | Translation result | End-to-end delay |
+|---|---:|---|---|---|---|---:|
+| Quiet room | Low | “The model is trained on classroom data.” | Good | Good | Good | 1.2s |
+| Mild background chatter | Medium | “We compare latency and accuracy for each model.” | Acceptable | Good | Good | 2.1s |
+| Loud classroom | High | “This is an example of a noisy classroom environment.” | Partial | Some error | Acceptable | >3s |
+
+## Known Limitations
+- The built-in microphone may be weak in louder classrooms
+- VAD may miss soft speech or misclassify noise if the acoustic environment is too noisy
+- the correction model is intentionally lightweight, so it may not fully correct every grammar issue
+- the translation pipeline is optimized for short lecture sentences and may be less stable for long or highly technical speech
+- if Ollama is not running, the system falls back to basic cleanup, which is less accurate than full LLM correction
+
+## Privacy and Cost Considerations
+- transcription and translation are processed locally when possible
+- the correction path can be kept local via Ollama, reducing cloud data exposure
+- no paid API is strictly required for the core prototype
+- the local pipeline is more privacy-preserving than cloud transcription services
+
+## Summary
+This project demonstrates a practical local speech-to-text and translation pipeline for a classroom scenario. It is intentionally designed for portability, low setup burden, and responsiveness rather than for maximum acoustic perfection. It is a suitable prototype for live classroom support, especially when deployment speed and privacy are important.
+
+## How to Improve the Project Further
+- add a dedicated external USB microphone for better classroom quality
+- add a stronger noise suppression front end
+- store latency logs to CSV for easier evaluation
+- add configuration file support for model selection and GUI preferences
+- create a simpler web version for broader device compatibility
+
+## Notes for Final Submission
+Before the final demonstration, the group should collect the following evidence:
+1. a live screenshot of the GUI
+2. terminal logs or a short video recording
+3. measured end-to-end latency for at least three scenarios
+4. description of noise conditions during testing
+5. summary of limitations and where the system fails
+6. a short explanation of why the final architecture is appropriate for the assignment
